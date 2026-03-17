@@ -164,6 +164,116 @@
 
 Итоговая конфигурация 2 серверов L7: CPU 16 Cores, NIC 10Gbps.
 
+## 5. Логическая схема БД
+
+### 5.1 Схема БД
+
+``` mermaid
+erDiagram
+    USER {
+        UUID id PK
+        String phone "Номер телефона (auth)"
+        String name "Имя"
+        String default_address "Основной адрес"
+        Timestamp created_at
+    }
+
+    SESSION_CACHE {
+        String token PK "Токен сессии (Redis)"
+        UUID user_id FK
+        JSON cart_data "Временная корзина"
+        Timestamp expires_at
+    }
+
+    DARKSTORE {
+        Int id PK
+        String address "Физический адрес"
+        Geography coordinates "Точка на карте"
+        Geometry delivery_zone "Полигон зоны доставки"
+    }
+
+    PRODUCT {
+        Int id PK
+        String name "Название"
+        Int category_id "Категория"
+        String description "Описание"
+        String image_url "Ссылка на S3 (File Storage)"
+    }
+
+    INVENTORY {
+        Int darkstore_id PK, FK
+        Int product_id PK, FK
+        Int quantity_available "Доступно к продаже"
+        Int quantity_reserved "Забронировано в корзинах"
+        Decimal price "Локальная цена"
+    }
+
+    ORDER {
+        UUID id PK
+        UUID user_id FK
+        Int darkstore_id FK
+        UUID courier_id FK "Может быть NULL пока не назначен"
+        String status "Created, Assembling, Delivering, Delivered"
+        Decimal total_price "Итоговая сумма"
+        String delivery_address "Адрес доставки"
+        Timestamp created_at
+    }
+
+    ORDER_ITEM {
+        UUID id PK
+        UUID order_id FK
+        Int product_id FK
+        Int quantity "Количество"
+        Decimal price_at_purchase "Цена на момент покупки"
+    }
+
+    COURIER {
+        UUID id PK
+        String name "Имя курьера"
+        String status "Active, Offline, Busy"
+        Int current_darkstore_id FK "Привязка к складу"
+    }
+
+    COURIER_LOCATION_LOG {
+        UUID id PK
+        UUID courier_id FK
+        Float latitude "Широта"
+        Float longitude "Долгота"
+        Timestamp recorded_at "Время фиксации"
+    }
+
+    FILE_STORAGE_S3 {
+        String image_url PK
+        Binary file_data "Медиафайлы (JPG, PNG)"
+    }
+
+    USER ||--o{ ORDER : places
+    USER ||--o{ SESSION_CACHE : has
+    DARKSTORE ||--o{ ORDER : processes
+    DARKSTORE ||--o{ INVENTORY : holds
+    PRODUCT ||--o{ INVENTORY : stocked_in
+    PRODUCT ||--o{ FILE_STORAGE_S3 : uses
+    ORDER ||--|{ ORDER_ITEM : contains
+    PRODUCT ||--o{ ORDER_ITEM : is_part_of
+    COURIER ||--o{ ORDER : delivers
+    COURIER ||--o{ COURIER_LOCATION_LOG : tracks
+    DARKSTORE ||--o{ COURIER : assigned_to
+```
+
+### 5.2 Таблица таблиц БД
+
+| Сущность | Количество записей | Размер данных | QPS (Read) Ср / Пик | QPS (Write) Ср / Пик | Консистентность | Особенности шардинга |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| USER (Профили) | 5 млн | ~25 Гб | 58 / 174 | 2 / 5 | Eventual | Hash-шардинг по id. Равномерное распределение. |
+| SESSION_CACHE (Корзины - Redis) | 2 млн (DAU) | ~2 Гб (RAM) | 240 / 720 | 46 / 138 | Strict | Hash-шардинг по token. Равномерная нагрузка. |
+| DARKSTORE (Склады) | 663 | < 1 Мб | 58 / 174 | < 0.1 | Eventual | Не шардируется. Данные кэшируются в RAM на всех репликах, так как меняются крайне редко. |
+| PRODUCT (Справочник) | 5 000 | ~2.5 Мб | 185 / 555 | < 0.1 | Eventual | Не шардируется. Справочник полностью помещается в кэш. |
+| INVENTORY (Остатки/Цены) | 3.3 млн | ~1.7 Гб | 185 / 555 | 51 / 153 | Strict (ACID) | Шардинг по darkstore_id. Склады в центре Москвы создают в разы больше транзакций, чем в регионах. Применяется Directory-based шардинг для ручной балансировки «горячих» шардов на выделенные серверы. |
+| ORDER + ORDER_ITEM | 146 млн/год | ~292 Гб | 23 / 69 | 5 / 15 | Strict (ACID) | Hash-шардинг по user_id. Все заказы одного юзера лежат на одном шарде. |
+| COURIER (Статусы) | 16 500 | ~5 Мб | 10 / 30 | 5 / 15 | Strict | Не шардируется (малый объем). |
+| COURIER_LOCATION_LOG | 8.5 млрд (за 30 дн) | ~850 Гб | 1111 / 3333 | 3300 / 9900 | Eventual | Hash-шардинг по courier_id для распределения записи + партиционирование по дате для быстрого удаления старых логов. |
+| FILE_STORAGE_S3 (Медиа) | ~10 000 файлов | ~2 Гб | CDN (Offload) | < 0.1 | Eventual | Объектное хранилище. Ключ — image_url. Нагрузка на чтение снимается Edge-серверами CDN. |
+
 ## Источники
 
 1. https://lavka.yandex.ru/about/franchise
