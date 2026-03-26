@@ -280,6 +280,88 @@ erDiagram
     DARKSTORE ||--o{ COURIER : assigned_to
 ```
 
+## 6. Физическая схема БД
+
+### 6.1 Схема системы
+
+```mermaid
+graph TD
+    subgraph "Бэкенд"
+        API[API Servers]
+        GEO[Telemetry Servers]
+    end
+
+    subgraph "Connection Multiplexing"
+        PB[PgBouncer]
+    end
+
+    subgraph "Транзакции и Справочники (PostgreSQL)"
+        direction LR
+        PG_M[(Master\nДЦ Подмосковье-1)]
+        PG_S[(Sync Replica\nДЦ Подмосковье-2)]
+        PG_A[(Async Replica\nДЦ Санкт-Петербург)]
+        PG_M -- Синхронная репликация --> PG_S
+        PG_M -- Асинхронная репликация --> PG_A
+    end
+
+    subgraph "Телеметрия (Cassandra)"
+        CAS[(Cassandra Cluster)]
+    end
+
+    subgraph "Асинхронная шина данных"
+        KAFKA[[Apache Kafka]]
+    end
+
+    subgraph "Поиск (Elasticsearch)"
+        ES[(Elasticsearch Cluster)]
+    end
+
+    subgraph "Аналитика (ClickHouse)"
+        CH[(ClickHouse Cluster)]
+    end
+
+    subgraph "Кэш и Сессии (Redis)"
+        RED[(Redis Cluster)]
+    end
+
+    subgraph "Объектное хранилище (Ceph / S3)"
+        S3[(Ceph S3\nКартинки + Бэкапы)]
+    end
+
+    API --> PB
+    PB --> PG_M
+    API --> RED
+    API --> S3
+    API --> ES
+    API -- "Асинхронные события\n(CDC, Analytics)" --> KAFKA
+    KAFKA --> CH
+    KAFKA --> ES
+    GEO --> CAS
+    
+    PG_M -. "WAL Archiving" .-> S3
+```
+
+### 6.2 Таблица с описанием физической схемы БД
+
+| Таблица / Данные | СУБД | Индексы | Денормализация | Шардирование и резервирование | Балансировка и клиентские библиотеки | Резервное копирование |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| USER, ADDRESS | PostgreSQL | B-tree по phone, B-tree по user_id | Нет | Hash-шардинг по user_id. Резерв: Master (МСК-1), Sync Replica (МСК-2), Async Replica (СПБ) | Клиент pgx. Мультиплексирование через PgBouncer перед каждой БД | Full-бэкап 1 раз в сутки ночью (на S3). WAL-архивирование каждую минуту |
+| SESSION_CACHE | Redis | Key-value по token | Хранение JSON-структуры корзины | Redis Cluster | Клиент go-redis. Встроенный пулинг соединений | Отключено. При сбое сессии сбрасываются для экономии ресурсов |
+| CATEGORY, PRODUCT, DARKSTORE | PostgreSQL | Нет | Склеивание PRODUCT и INVENTORY происходит в in-memory кэше приложения | Не шардируется. Резерв: аналогично USER | Чтение идет с Async Replica (СПБ) или локального in-memory кэша бэкенда | В рамках бэкапа основного кластера PostgreSQL |
+| INVENTORY | PostgreSQL | B-tree по darkstore_id | Нет | Directory-based по darkstore_id. Резерв: аналогично USER | Роутинг запросов через Directory-сервис, далее подключение через PgBouncer | В рамках общего кластера + бэкап Directory-базы |
+| ORDER | PostgreSQL | B-tree по user_id, B-tree по darkstore_id + status | ORDER_ITEM вложен в массив JSONB, total_price предрасчитан | Hash-шардинг по user_id. Резерв: аналогично USER | Транзакции через PgBouncer. L7-балансировщик направляет запросы на нужный шард | В рамках бэкапа основного кластера PostgreSQL |
+| COURIER_LOCATION | Cassandra | Partition Key: courier_id. Clustering Key: timestamp | Нет | Консистентное хэширование. Партиционирование по дням. Фактор репликации 3 | Клиент gocql. Token-aware маршрутизация | Снапшоты раз в сутки. Очистка старых логов через TTL |
+| SEARCH_ENGINE_INDEX | Elasticsearch | Inverted Index по search_text | Дублирование category_id для фильтрации | Shard-маршрутизация по product_id. Репликация внутри кластера. | REST API. Обновление индексов асинхронно через Kafka | Снапшоты индексов в S3 |
+| DWH_ANALYTICS_EVENT | ClickHouse | Сортировка по event_time, event_type | Хранение payload в JSON | Шардирование по user_id. Партиционирование по месяцам. | Запись пачками из Kafka через ClickHouse Kafka Engine | Бэкапы не критичны, хранение агрегатов |
+| Медиафайлы (S3) | Ceph | URL-ключ объекта | Объектное хранилище | Избыточное кодирование. Репликация между ДЦ | AWS S3 SDK для бэкенда. Отдача контента через CDN | Георепликация бакетов в фоновом режиме |
+
+### 6.3 Обоснование отказоустойчивости и работы под нагрузкой
+
+1. Транзакционная нагрузка: Пиковая нагрузка на запись составляет менее 500 RPS. PostgreSQL с использованием пулера соединений PgBouncer и Directory-based шардинга для INVENTORY (исключение блокировок горячих складов) имеет многократный запас прочности. Надежность обеспечивается синхронной репликацией в соседний ДЦ.
+2. Тяжелая запись телеметрии: Пиковые 9 900 RPS записей от курьеров изолированы в отдельном кластере Cassandra. Использование LSM-Tree структуры минимизирует I/O задержки при записи на диск. Token-aware маршрутизация устраняет лишние сетевые прыжки. Отказоустойчивость реализуется Фактором репликации 3.
+3. Поиск: 210 RPS тяжелых текстовых запросов обрабатываются через инвертированные индексы Elasticsearch, снимая процессорную нагрузку с PostgreSQL. Индексы обновляются асинхронно через Apache Kafka.
+4. Аналитика: Сырые события поступают в брокер сообщений Apache Kafka. ClickHouse забирает данные микробатчами, что гарантирует стабильную производительность базы при любых скачках активности пользователей.
+
 ## Источники
 
 1. https://lavka.yandex.ru/about/franchise
