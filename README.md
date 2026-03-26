@@ -172,17 +172,40 @@
 erDiagram
     USER {
         UUID id PK
-        String phone "Номер телефона (auth)"
+        String phone "Номер телефона"
+        String password_hash "Хэш пароля"
         String name "Имя"
-        String default_address "Основной адрес"
         Timestamp created_at
     }
 
+    ADDRESS {
+        UUID id PK
+        UUID user_id FK
+        String full_address "Текстовый адрес"
+        Float latitude "Широта"
+        Float longitude "Долгота"
+        String door_details "Квартира, этаж, домофон"
+    }
+
     SESSION_CACHE {
-        String token PK "Токен сессии (Redis)"
+        String token PK "Токен сессии"
         UUID user_id FK
         JSON cart_data "Временная корзина"
         Timestamp expires_at
+    }
+
+    CATEGORY {
+        Int id PK
+        String name "Название категории"
+        Int parent_id FK "Ссылка на родителя"
+    }
+
+    PRODUCT {
+        Int id PK
+        String name "Название"
+        Int category_id FK "Ссылка на CATEGORY"
+        String description "Описание"
+        String image_url "Ссылка на S3"
     }
 
     DARKSTORE {
@@ -190,14 +213,6 @@ erDiagram
         String address "Физический адрес"
         Geography coordinates "Точка на карте"
         Geometry delivery_zone "Полигон зоны доставки"
-    }
-
-    PRODUCT {
-        Int id PK
-        String name "Название"
-        Int category_id "Категория"
-        String description "Описание"
-        String image_url "Ссылка на S3 (File Storage)"
     }
 
     INVENTORY {
@@ -212,19 +227,12 @@ erDiagram
         UUID id PK
         UUID user_id FK
         Int darkstore_id FK
-        UUID courier_id FK "Может быть NULL пока не назначен"
+        UUID courier_id FK "Может быть NULL"
         String status "Created, Assembling, Delivering, Delivered"
         Decimal total_price "Итоговая сумма"
-        String delivery_address "Адрес доставки"
+        UUID delivery_address_id FK "Ссылка на ADDRESS"
+        JSON items "Массив JSON:[{product_id, qty, price_at_purchase}]"
         Timestamp created_at
-    }
-
-    ORDER_ITEM {
-        UUID id PK
-        UUID order_id FK
-        Int product_id FK
-        Int quantity "Количество"
-        Decimal price_at_purchase "Цена на момент покупки"
     }
 
     COURIER {
@@ -239,40 +247,38 @@ erDiagram
         UUID courier_id FK
         Float latitude "Широта"
         Float longitude "Долгота"
-        Timestamp recorded_at "Время фиксации"
+        Timestamp recorded_at
     }
 
-    FILE_STORAGE_S3 {
-        String image_url PK
-        Binary file_data "Медиафайлы (JPG, PNG)"
+    SEARCH_ENGINE_INDEX {
+        Int product_id PK
+        String search_text "Индексируемый текст (название + синонимы)"
+        Int category_id "Для фильтрации"
     }
 
+    DWH_ANALYTICS_EVENT {
+        UUID event_id PK
+        UUID user_id FK "Кто совершил"
+        String event_type "Тип (item_click, add_to_cart, search)"
+        JSON payload "Контекст события"
+        Timestamp event_time "Время"
+    }
+
+    USER ||--o{ ADDRESS : has
     USER ||--o{ ORDER : places
     USER ||--o{ SESSION_CACHE : has
+    USER ||--o{ DWH_ANALYTICS_EVENT : generates
+    ADDRESS ||--o{ ORDER : delivered_to
+    CATEGORY ||--o{ CATEGORY : parent_child
+    CATEGORY ||--o{ PRODUCT : contains
     DARKSTORE ||--o{ ORDER : processes
     DARKSTORE ||--o{ INVENTORY : holds
     PRODUCT ||--o{ INVENTORY : stocked_in
-    PRODUCT ||--o{ FILE_STORAGE_S3 : uses
-    ORDER ||--|{ ORDER_ITEM : contains
-    PRODUCT ||--o{ ORDER_ITEM : is_part_of
+    PRODUCT ||--o| SEARCH_ENGINE_INDEX : indexed_in
     COURIER ||--o{ ORDER : delivers
     COURIER ||--o{ COURIER_LOCATION_LOG : tracks
     DARKSTORE ||--o{ COURIER : assigned_to
 ```
-
-### 5.2 Таблица таблиц БД
-
-| Сущность | Количество записей | Размер данных | QPS (Read) Ср / Пик | QPS (Write) Ср / Пик | Консистентность | Особенности шардинга |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| USER (Профили) | 5 млн | ~25 Гб | 58 / 174 | 2 / 5 | Eventual | Hash-шардинг по id. Равномерное распределение. |
-| SESSION_CACHE (Корзины - Redis) | 2 млн (DAU) | ~2 Гб (RAM) | 240 / 720 | 46 / 138 | Strict | Hash-шардинг по token. Равномерная нагрузка. |
-| DARKSTORE (Склады) | 663 | < 1 Мб | 58 / 174 | < 0.1 | Eventual | Не шардируется. Данные кэшируются в RAM на всех репликах, так как меняются крайне редко. |
-| PRODUCT (Справочник) | 5 000 | ~2.5 Мб | 185 / 555 | < 0.1 | Eventual | Не шардируется. Справочник полностью помещается в кэш. |
-| INVENTORY (Остатки/Цены) | 3.3 млн | ~1.7 Гб | 185 / 555 | 51 / 153 | Strict (ACID) | Шардинг по darkstore_id. Склады в центре Москвы создают в разы больше транзакций, чем в регионах. Применяется Directory-based шардинг для ручной балансировки «горячих» шардов на выделенные серверы. |
-| ORDER + ORDER_ITEM | 146 млн/год | ~292 Гб | 23 / 69 | 5 / 15 | Strict (ACID) | Hash-шардинг по user_id. Все заказы одного юзера лежат на одном шарде. |
-| COURIER (Статусы) | 16 500 | ~5 Мб | 10 / 30 | 5 / 15 | Strict | Не шардируется (малый объем). |
-| COURIER_LOCATION_LOG | 8.5 млрд (за 30 дн) | ~850 Гб | 1111 / 3333 | 3300 / 9900 | Eventual | Hash-шардинг по courier_id для распределения записи + партиционирование по дате для быстрого удаления старых логов. |
-| FILE_STORAGE_S3 (Медиа) | ~10 000 файлов | ~2 Гб | CDN (Offload) | < 0.1 | Eventual | Объектное хранилище. Ключ — image_url. Нагрузка на чтение снимается Edge-серверами CDN. |
 
 ## Источники
 
