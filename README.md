@@ -391,6 +391,102 @@ graph TD
 | Docker | Контейнеризация | Современный стандарт для простого развертывания и эксплуатирования программ в контейнерах. |
 | Kubernetes | Оркестрация контейнеров | Автоматическое масштабирование контейнеров с бэкендом в часы пиковых нагрузоки автоматический перезапуск упавших сервисов. |
 | Prometheus и Grafana | Мониторинг и алертинг | Сбор метрик со всех узлов системы (RPS, Latency, потребление CPU). Построение дашбордов для визуализации нагрузки и настройка уведомлений при отказах в дата-центрах. |
+| OSRM (Open Source Routing Machine) | Построение маршрутов и расчет точного времени доставки | Специализированный движок маршрутизации. Позволяет применять графовые алгоритмы, учитывая перекрытия, заборы и дворовые тропинки, что критично для пеших курьеров. |
+| MQTT (Message Queuing Telemetry Transport) | Двунаправленная связь с приложением курьера | Легковесный протокол. В отличие от обычного HTTP, он держит постоянное соединение, гарантирует доставку пакетов при перебоях связи и экономит заряд батареи курьерского смартфона за счет крошечного размера заголовков. |
+
+## 9. Схема проекта
+
+### 9.1 Архитектурная схема взаимодействия сервисов
+
+В проекте используется микросервисная архитектура с паттерном API-Gateway и логическим разделением баз данных Database per service.
+
+```mermaid
+graph TD
+    U["Пользователь<br>(iOS/Android/Web)"]
+    C["Курьер<br>(iOS/Android)"]
+
+    subgraph "Global Load Balancing"
+        DNS["Geo-DNS<br>(lavka.yandex.ru / api...)"]
+        ANY["Anycast Routing<br>(geo.lavka.yandex.ru)"]
+    end
+
+    subgraph "ДЦ Подмосковье-1 (Active)"
+        L4_API["L4 Balancer<br>Keepalived + LVS"]
+        L4_GEO["L4 Balancer<br>Keepalived + LVS"]
+        
+        API_GW["API Gateway / L7<br>Nginx Cluster"]
+        GEO_GW["Telemetry L7<br>Nginx/MQTT Proxy"]
+        
+        AuthSvc["Auth Service"]
+        CatalogSvc["Catalog & Search Service"]
+        OrderSvc["Order & Checkout Service"]
+        InventorySvc["Inventory Service"]
+        TelemetrySvc["Courier Telemetry Service"]
+        
+        PB["PgBouncer"]
+        KAFKA[["Apache Kafka"]]
+    end
+
+    subgraph "Data Layer"
+        PG_U[("PostgreSQL<br>Users/Orders")]
+        PG_INV[("PostgreSQL<br>Inventory Shards")]
+        REDIS[("Redis<br>Sessions/Cart")]
+        ES[("Elasticsearch<br>Index")]
+        CAS[("Cassandra<br>Locations")]
+        CH[("ClickHouse<br>DWH")]
+    end
+
+    U -- "HTTPS" --> DNS
+    DNS -- "IP ДЦ" --> L4_API
+    L4_API -- "TCP" --> API_GW
+    
+    API_GW -- "REST/gRPC" --> AuthSvc
+    API_GW -- "REST/gRPC" --> CatalogSvc
+    API_GW -- "REST/gRPC" --> OrderSvc
+    
+    AuthSvc -. "Read/Write" .-> REDIS
+    AuthSvc --> PB
+    
+    CatalogSvc -. "Search Query" .-> ES
+    CatalogSvc --> PB
+    
+    OrderSvc -. "Check Cart" .-> REDIS
+    OrderSvc -- "Reserve" --> InventorySvc
+    OrderSvc --> PB
+    
+    InventorySvc --> PB
+    PB --> PG_U
+    PB --> PG_INV
+
+    C -- "MQTT" --> ANY
+    ANY -- "BGP Route" --> L4_GEO
+    L4_GEO --> GEO_GW
+    GEO_GW --> TelemetrySvc
+    TelemetrySvc -- "LSM Write" --> CAS
+
+    OrderSvc -- "Order Created Event" --> KAFKA
+    InventorySvc -- "Stock Update Event" --> KAFKA
+    TelemetrySvc -- "Location Event" --> KAFKA
+    
+    KAFKA -- "Index Update" --> ES
+    KAFKA -- "Microbatching" --> CH
+```
+
+### 9.2 Пояснения к потокам данных и балансировке
+
+1. Внешняя балансировка и изоляция трафика
+Для защиты транзакционной части системы от тяжелого фонового трафика курьеров, внешняя маршрутизация разделена на два контура:
+*   Транзакционный контур: Балансируется через Geo-DNS. Пользователь направляется в ближайший из 3-х ДЦ. Алгоритм управления весами на уровне DNS позволяет перенаправить трафик с упавшего ДЦ на резервные.
+*   Контур телеметрии: Балансируется через Anycast. UDP/TCP пакеты от курьеров маршрутизируются средствами BGP на ближайшую точку присутствия. Это минимизирует Latency для обновления координат.
+
+2. Внутренняя балансировка
+*   L4: На входе в дата-центр стоят пары серверов с Keepalived + LVS. Они принимают трафик на Virtual IP и равномерно раскидывают TCP-соединения по L7-балансировщикам.
+*   L7: Nginx кластеры выступают в роли API Gateway. Они терминируют SSL, проводят Rate Limiting, проверяют JWT-токены и осуществляют Service Discovery — маршрутизацию HTTP/gRPC запросов к нужным микросервисам.
+
+3. Синхронные и асинхронные потоки
+*   Синхронный поток: При оформлении заказа OrderSvc синхронно обращается к InventorySvc для бронирования остатков. Запросы к PostgreSQL идут исключительно через мультиплексор PgBouncer, чтобы не исчерпать лимит соединений БД.
+*   Шардинг INVENTORY: InventorySvc реализует логику Directory-based шардинга. Получив запрос на бронирование, он определяет darkstore_id и направляет транзакцию в конкретный шард PostgreSQL, изолируя склады друг от друга.
+*   Асинхронный поток: Все некритичные для моментального ответа пользователю действия вынесены в брокер сообщений Apache Kafka. Например, изменение статуса заказа или изменение остатков формирует событие в Kafka. Оттуда данные асинхронно забираются для обновления поискового индекса в Elasticsearch и для аналитики в ClickHouse микробатчингом. Это гарантирует, что тяжелая аналитика никогда не замедлит пользовательский запрос оформления заказа.
 
 ## Источники
 
